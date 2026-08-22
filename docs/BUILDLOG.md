@@ -14316,3 +14316,84 @@ a clean build.
 
 NOT VERIFIED: no live re-run of the failing session (needs the GPU host), and
 neither backend compiled -- no CUDA and no Apple-silicon machine available.
+
+## 2026-08-22 (c): the dialect has no escaping, so writing ABOUT a tool call destroyed the tool call
+
+The document describing this bug was truncated at 651 bytes BY this bug, mid
+sentence, exactly where it was about to type `</tool_call>`. That is the whole
+report.
+
+The XML dialect provides no escape mechanism, so a call whose parameter value
+legitimately contains the protocol's own bytes -- a doc, a verifier, a bug
+write-up -- collides with the channel delimiter:
+
+```
+<tool_call>
+<function=write>
+<parameter=content>
+The model emitted:
+```
+<tool_call>
+{"name":"bash"}
+</tool_call>          <-- StreamSplitter closed the TOOL channel HERE
+```
+and never closed it.
+</parameter>
+</function>
+</tool_call>
+```
+
+`StreamSplitter`'s TOOL branch was a bare `hold.find("</tool_call>")`. The TEXT
+channel has careful structural-vs-inert logic (that is what keeps a fenced
+example from firing a call); the TOOL channel had none at all. So the call was
+cut at the inner tag, failed to parse, recovered NOTHING, and the trailing
+`</parameter></function>` leaked as visible text -- `calls=0`. Measured on
+master and on every branch: the model's own diagnosis in the live session was
+right, "the harness is interpreting it as its own delimiter".
+
+### Why the obvious fix is wrong
+
+"Ignore `</tool_call>` inside a parameter value" breaks a case that works
+today. Models routinely FORGET the final `</parameter>` and close with
+`</tool_call>`; `parse_native_xml_call` tolerates exactly that (the 2026-08-15
+EOF leniency). Ignoring the tag there means never closing, and the call is lost
+in the other direction.
+
+The two cases are indistinguishable at the moment the tag arrives, and become
+distinguishable later: if the value CLOSES afterwards, the tag was content; if
+the generation ENDS first, the tag was the closer.
+
+### The rule: provisional closers
+
+An in-value `</tool_call>` is PROVISIONAL. Bytes from it are HELD rather than
+emitted, so the decision stays open until the evidence arrives. A subsequent
+`</parameter>`/`</function>` proves it was content and the held bytes are
+released; `flush()` reaching end-of-generation with one still pending promotes
+it to the real closer and splits exactly where the old code did. Both cases now
+work, and nothing had to be guessed at the point of ambiguity.
+
+The value-state machine also has to survive feed() boundaries. The TOOL channel
+previously held back only a partial `</tool_call>`, so a `<parameter=` split
+across two tokens was never seen, `tool_in_value` stayed false, and the next
+in-value `</tool_call>` read as structural. That made the whole fix a
+whole-string-only fix -- it passed on one-shot input and failed on real
+streaming, which is the only mode that matters. `tool_keep()` now holds back a
+partial prefix of any of the four dialect markers, plus an unterminated
+`<parameter=` opener whose `>` has not arrived. Every fixture is pinned at
+chunk sizes 1, 5 and whole-string, because chunk=whole would have shipped this
+broken.
+
+### Measured
+
+7 new assertions in `test_stream_split`: content-with-closers recovers with the
+value byte-identical (bytewise and chunked), an unterminated value still
+promotes its provisional to the closer, trailing bytes after a promoted closer
+route to TEXT, a split `<parameter=` opener keeps its state, and a
+zero-parameter call closes immediately. Full `make test-tools` green from a
+clean build, and the four earlier live reproductions re-verified unchanged.
+
+Known limit, unchanged: this reasons about the XML dialect's value spans. A JSON
+dialect body whose string value contains `</tool_call>` has the same collision
+and is not covered.
+
+NOT VERIFIED: neither backend compiled -- no CUDA and no Apple-silicon host.
