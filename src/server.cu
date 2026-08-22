@@ -2063,7 +2063,9 @@ int main(int argc, char** argv) {
             tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                         eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
             auto params_per_name = q27::tool_param_keys_per_name(tools);
-            tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
+            auto required_per_name = q27::tool_required_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, required_per_name,
+                     q27::tool_dialect_xml());
             // FORCED: the opener was injected into the PROMPT, not generated,
             // so the splitter must start already inside the TOOL channel or
             // the call body would be read back as ordinary text.
@@ -2283,7 +2285,9 @@ int main(int argc, char** argv) {
                 tc.enabled = constrain_tools && tchoice.mode != q27::ToolChoice::FORCED &&
                             eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
                 auto params_per_name = q27::tool_param_keys_per_name(tools);
-                tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
+                auto required_per_name = q27::tool_required_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, required_per_name,
+                         q27::tool_dialect_xml());
                 StreamSplitter sp;
                 q27::ThinkBudgetState tb{think_budget};
                 Engine::DecodeTask bt;
@@ -2676,7 +2680,9 @@ int main(int argc, char** argv) {
             tc.enabled = constrain_tools && tchoice.mode!=q27::ToolChoice::FORCED &&
                          eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
             auto params_per_name = q27::tool_param_keys_per_name(tools);
-            tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
+            auto required_per_name = q27::tool_required_keys_per_name(tools);
+            tc.begin(tool_names_v, params_per_name, required_per_name,
+                     q27::tool_dialect_xml());
             eng.on_pending = [&](int id) { tc.on_pending(id); };
             eng.on_drafts = [&](const int* dr) { tc.on_drafts(dr); };
             eng.on_round = [&](const int* em, int nr) {
@@ -2821,7 +2827,9 @@ int main(int argc, char** argv) {
                 tc.enabled = constrain_tools && tchoice.mode!=q27::ToolChoice::FORCED &&
                              eng.samp.inv_temp <= 0.f; // constrained+sampled is Phase 3
                 auto params_per_name = q27::tool_param_keys_per_name(tools);
-                tc.begin(tool_names_v, params_per_name, q27::tool_dialect_xml());
+                auto required_per_name = q27::tool_required_keys_per_name(tools);
+                tc.begin(tool_names_v, params_per_name, required_per_name,
+                         q27::tool_dialect_xml());
                 int block_counter = 0, tool_counter = 0;
                 bool any_call = false;
                 bool alive = true; // cleared when a write fails (client disconnected)

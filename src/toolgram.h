@@ -483,8 +483,25 @@ struct ToolGrammarXml {
     // schema-aware reset: params_per_name aligned with tool_names
     void reset(const std::vector<std::string>& tool_names,
                const std::vector<std::vector<std::string>>& params_per_name) {
+        reset(tool_names, params_per_name, {});
+    }
+    // schema-aware reset WITH required-argument enforcement (issue #2).
+    // required_per_name is aligned with tool_names; each entry lists the keys
+    // from the schema's `parameters.required`. Shape-only constraint was never
+    // enough: the grammar happily closed a <function=write> call with ZERO
+    // parameters, so the server emitted schema-invalid tool_calls (missing
+    // `path`), returned 200, logged no drift -- and the agent's client rejected
+    // them, dead-looping the session with no server-side signal at all.
+    void reset(const std::vector<std::string>& tool_names,
+               const std::vector<std::vector<std::string>>& params_per_name,
+               const std::vector<std::vector<std::string>>& required_per_name) {
         names_ = tool_names;
         params_per_name_ = params_per_name;
+        required_per_name_ = required_per_name;
+        cur_params_.clear();
+        cur_required_.clear();
+        emitted_.clear();
+        required_key_.clear();
         std::vector<std::string> sorted = tool_names;
         std::sort(sorted.begin(), sorted.end());
         names_key_.clear();
@@ -543,6 +560,14 @@ struct ToolGrammarXml {
         CLOSED_         // past closer
     };
 
+    // every required parameter emitted? Vacuously true with no schema, which
+    // preserves the permissive names-only behaviour.
+    bool required_satisfied() const {
+        for (size_t j = 0; j < cur_required_.size(); j++)
+            if (cur_required_[j] && !emitted_[j]) return false;
+        return true;
+    }
+
     static bool is_ws(char c) {
         return c == ' ' || c == '\n' || c == '\r' || c == '\t';
     }
@@ -580,11 +605,26 @@ struct ToolGrammarXml {
                         if (names_[i] == name_pref_) {
                             cur_name_idx_ = (int)i;
                             cur_params_key_.clear();
+                            required_key_.clear();
+                            cur_params_.clear();
+                            cur_required_.clear();
                             if (i < params_per_name_.size()) {
                                 auto pk = params_per_name_[i];
                                 std::sort(pk.begin(), pk.end());
+                                cur_params_ = pk;   // sorted -> stable indices
                                 for (auto& k : pk) { cur_params_key_ += k; cur_params_key_ += '\x1f'; }
                             }
+                            // required flags, aligned with cur_params_
+                            cur_required_.assign(cur_params_.size(), 0);
+                            if (i < required_per_name_.size()) {
+                                auto rq = required_per_name_[i];
+                                std::sort(rq.begin(), rq.end());
+                                for (auto& k : rq) { required_key_ += k; required_key_ += '\x1f'; }
+                                for (size_t j = 0; j < cur_params_.size(); j++)
+                                    for (auto& k : rq)
+                                        if (k == cur_params_[j]) { cur_required_[j] = 1; break; }
+                            }
+                            emitted_.assign(cur_params_.size(), 0);
                             st_ = GT1;
                             return true;
                         }
@@ -629,10 +669,18 @@ struct ToolGrammarXml {
                         st_ = GT2;
                         return true;
                     }
-                    if (cur_name_idx_ >= 0 && cur_name_idx_ < (int)params_per_name_.size()) {
-                        for (auto& k : params_per_name_[cur_name_idx_])
-                            if (k == key_pref_) { st_ = GT2; return true; }
-                    }
+                    // schema active: the key must be declared AND not already
+                    // emitted. A duplicate <parameter=content> used to be
+                    // accepted, doubling the value (issue #2) -- the model
+                    // reopened the tag mid-content when the content itself
+                    // quoted the dialect.
+                    for (size_t j = 0; j < cur_params_.size(); j++)
+                        if (cur_params_[j] == key_pref_) {
+                            if (emitted_[j]) return false; // duplicate key
+                            emitted_[j] = 1;
+                            st_ = GT2;
+                            return true;
+                        }
                     return false;
                 }
                 std::string next = key_pref_ + c;
@@ -666,7 +714,14 @@ struct ToolGrammarXml {
                 return false;
             case SLASH:
                 if (c == 'p') { lit_word_ = "</parameter>"; lit_ = 3; st_ = PARAM_CLOSE; return true; }
-                if (c == 'f') { lit_word_ = "</function>"; lit_ = 3; st_ = FUNC_CLOSE; return true; }
+                // Closing the call is illegal until every REQUIRED parameter
+                // has been emitted (issue #2). This is the whole point: the
+                // decoder masks </function> out, so the model cannot end a
+                // <function=write> call that never produced <parameter=path>.
+                if (c == 'f') {
+                    if (!required_satisfied()) return false;
+                    lit_word_ = "</function>"; lit_ = 3; st_ = FUNC_CLOSE; return true;
+                }
                 return false;
             case PARAM_CLOSE:
                 if (lit_ < lit_word_.size()) {
@@ -704,6 +759,11 @@ struct ToolGrammarXml {
 
     std::vector<std::string> names_;
     std::vector<std::vector<std::string>> params_per_name_;
+    std::vector<std::vector<std::string>> required_per_name_;
+    std::vector<std::string> cur_params_;   // sorted; indexes emitted_/cur_required_
+    std::vector<char> cur_required_;
+    std::vector<char> emitted_;
+    std::string required_key_;
     std::string names_key_;
     std::string cur_params_key_;
     std::string name_pref_;
@@ -724,6 +784,19 @@ struct ToolGrammarXml {
         std::string s;
         s += (char)('a' + (int)st_);
         s += dead_ ? '!' : '.';
+        // Required-argument enforcement (issue #2) makes token legality depend
+        // on WHICH keys were already emitted, in two places: KEY (a duplicate
+        // is illegal) and SLASH (</function> is illegal until required are
+        // satisfied). Both must therefore be part of the mask cache key, or a
+        // stale mask would let the model close a call it must not close. The
+        // emitted set is monotone within a call, so this adds at most one new
+        // cached state per parameter, not a combinatorial blow-up.
+        auto append_emitted = [&] {
+            s += '|';
+            for (size_t j = 0; j < emitted_.size(); j++) s += emitted_[j] ? '1' : '0';
+            s += '|';
+            s += required_key_;
+        };
         if (st_ == NAME) {
             s += '|';
             s += name_pref_;
@@ -734,6 +807,11 @@ struct ToolGrammarXml {
             s += key_pref_;
             s += '|';
             s += cur_params_key_;
+            append_emitted();
+        } else if (st_ == SLASH || st_ == VAL_LT || st_ == PARAM_LT ||
+                   st_ == WS1 || st_ == GT1) {
+            // states from which </function> is reachable
+            append_emitted();
         } else if (st_ == FUNC_LIT || st_ == PARAM_LIT) {
             s += '|';
             s += std::to_string(lit_);

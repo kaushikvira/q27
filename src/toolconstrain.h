@@ -39,6 +39,7 @@ struct BasicToolConstrainer {
     ToolGrammarXml tg_xml;     // XML-dialect sibling (3.8 trained format)
     std::vector<std::string> names;
     std::vector<std::vector<std::string>> params_per_name; // per-tool param-key allowlists (XML)
+    std::vector<std::vector<std::string>> required_per_name; // per-tool REQUIRED keys (issue #2)
     bool dialect_xml = false;  // select XML grammar (ToolGrammarXml) vs JSON (ToolGrammar)
     std::string tail; // rolling decoded-text window for the opener trigger
     int skip_feed = 0; // round tokens already consumed by scan_round
@@ -52,6 +53,7 @@ struct BasicToolConstrainer {
         names = std::move(n);
         dialect_xml = false;
         params_per_name.clear();
+        required_per_name.clear();
     }
     // Schema + dialect aware begin: pass params_per_name aligned with `n` and
     // dialect_xml=true to constrain the body with ToolGrammarXml (the 3.8
@@ -62,10 +64,21 @@ struct BasicToolConstrainer {
     void begin(std::vector<std::string> n,
                std::vector<std::vector<std::string>> pp,
                bool dialect_xml_) {
+        begin(std::move(n), std::move(pp), {}, dialect_xml_);
+    }
+    // With required_per_name the grammar also masks </function> until every
+    // required parameter has been emitted, and rejects duplicate keys
+    // (issue #2). Passing an empty required list keeps the old shape-only
+    // behaviour, so callers that lack the schema degrade rather than break.
+    void begin(std::vector<std::string> n,
+               std::vector<std::vector<std::string>> pp,
+               std::vector<std::vector<std::string>> rq,
+               bool dialect_xml_) {
         begin(std::move(n));
         dialect_xml = dialect_xml_;
         params_per_name = std::move(pp);
-        if (dialect_xml_) tg_xml.reset(names, params_per_name);
+        required_per_name = std::move(rq);
+        if (dialect_xml_) tg_xml.reset(names, params_per_name, required_per_name);
     }
     // pool id for grammar state g's legal-token mask (-1 if pool full)
     int mask_id(const ToolGrammar& g) {
@@ -229,7 +242,7 @@ struct BasicToolConstrainer {
             // remainder bytes after it already belong to the call body
             if (pos == std::string::npos || pos + 11 <= tail.size() - bytes.size()) continue;
             std::string rem = tail.substr(pos + 11);
-            if (dialect_xml) tg_xml.reset(names, params_per_name);
+            if (dialect_xml) tg_xml.reset(names, params_per_name, required_per_name);
             else tg.reset(names);
             active = true;
             engaged++;

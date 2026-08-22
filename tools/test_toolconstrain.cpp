@@ -5,6 +5,7 @@
 //
 // Build+run: g++ -std=c++17 -I src tools/test_toolconstrain.cpp -o build/test_toolconstrain && ./build/test_toolconstrain
 #include "toolconstrain.h"
+#include "api_common.h"
 
 #include <cassert>
 #include <cstdio>
@@ -529,6 +530,97 @@ static void test_xml_constrainer_dialect_dispatch() {
     CHECK(!g2.advance_str("<function=bash>\n<parameter=evil>\nrm -rf /\n</parameter>\n</function>\n"));
 }
 
+
+// Issue #2: shape-valid but SCHEMA-INVALID calls. --constrain-tools guaranteed
+// well-formed XML and nothing else: a <function=write> that never emitted
+// <parameter=path> closed cleanly, so the server returned 200 with
+// arguments={}, logged no drift, and only the CLIENT's schema validation
+// noticed -- the agent dead-looped and the file stayed 0 bytes.
+static void test_xml_required_args_enforced() {
+    using q27::ToolGrammarXml;
+    const std::vector<std::string> names = {"write"};
+    const std::vector<std::vector<std::string>> params = {{"path", "content"}};
+    const std::vector<std::vector<std::string>> required = {{"path", "content"}};
+    auto accepts = [&](const char* body) {
+        ToolGrammarXml g;
+        g.reset(names, params, required);
+        return g.advance_str(body) && g.done();
+    };
+
+    CHECK(accepts("<function=write>\n<parameter=path>\n/x\n</parameter>\n"
+                  "<parameter=content>\nhi\n</parameter>\n</function>\n"));
+    // order must not matter -- the schema says nothing about it
+    CHECK(accepts("<function=write>\n<parameter=content>\nhi\n</parameter>\n"
+                  "<parameter=path>\n/x\n</parameter>\n</function>\n"));
+    // the live failure: required key never emitted, call closed anyway
+    CHECK(!accepts("<function=write>\n<parameter=content>\nhi\n</parameter>\n</function>\n"));
+    // arguments={} -- the other live shape
+    CHECK(!accepts("<function=write>\n</function>\n"));
+    // duplicate key doubled the value when the content quoted the dialect
+    CHECK(!accepts("<function=write>\n<parameter=content>\na\n</parameter>\n"
+                   "<parameter=content>\nb\n</parameter>\n</function>\n"));
+
+    // OPTIONAL parameters must stay optional
+    {
+        const std::vector<std::vector<std::string>> p = {{"path", "content", "mode"}};
+        const std::vector<std::vector<std::string>> r = {{"path"}};
+        ToolGrammarXml g;
+        g.reset(names, p, r);
+        CHECK(g.advance_str("<function=write>\n<parameter=path>\n/x\n</parameter>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // NO schema -> permissive, exactly as before (callers without the schema
+    // must degrade, not break)
+    {
+        ToolGrammarXml g;
+        g.reset(names);
+        CHECK(g.advance_str("<function=write>\n<parameter=anything>\nv\n</parameter>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // params but NO required list -> shape-only, previous behaviour preserved
+    {
+        ToolGrammarXml g;
+        g.reset(names, params);
+        CHECK(g.advance_str("<function=write>\n</function>\n"));
+        CHECK(g.done());
+    }
+    // the mask cache MUST distinguish emitted-key sets, or a stale mask would
+    // let the model close a call it must not close
+    {
+        ToolGrammarXml a, b;
+        a.reset(names, params, required);
+        b.reset(names, params, required);
+        CHECK(a.advance_str("<function=write>\n<parameter=path>\n/x\n</parameter>\n"));
+        CHECK(b.advance_str("<function=write>\n<parameter=path>\n/x\n</parameter>\n"
+                            "<parameter=content>\nhi\n</parameter>\n"));
+        CHECK(a.signature() != b.signature());
+        // and </function> legality actually differs between them
+        ToolGrammarXml a2 = a, b2 = b;
+        CHECK(!a2.advance_str("</function>"));
+        CHECK(b2.advance_str("</function>"));
+    }
+}
+
+// The schema extractors must actually carry `required` through (it was parsed
+// nowhere before).
+static void test_required_keys_extractor() {
+    using nlohmann::json;
+    json tools = json::array({
+        {{"type","function"},{"function",{{"name","write"},
+          {"parameters",{{"type","object"},
+            {"properties",{{"path",{{"type","string"}}},{"content",{{"type","string"}}}}},
+            {"required",json::array({"path","content"})}}}}}},
+        {{"type","function"},{"function",{{"name","noreq"},
+          {"parameters",{{"type","object"},
+            {"properties",{{"a",{{"type","string"}}}}}}}}}}});
+    auto req = q27::tool_required_keys_per_name(tools);
+    CHECK(req.size() == 2);
+    CHECK(req.size() == 2 && req[0].size() == 2);
+    CHECK(req.size() == 2 && req[1].empty());   // absent `required` -> none
+    auto keys = q27::tool_param_keys_per_name(tools);
+    CHECK(keys.size() == 2 && keys[0].size() == 2);
+}
+
 int main() {
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
@@ -547,6 +639,8 @@ int main() {
     test_xml_grammar_valid_and_prevention();
     test_xml_cache_allowlist_in_key();
     test_xml_constrainer_dialect_dispatch();
+    test_xml_required_args_enforced();
+    test_required_keys_extractor();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

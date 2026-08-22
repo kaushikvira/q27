@@ -14188,3 +14188,116 @@ is a source-level fact about the vendored header's API, and the CUDA-side
 changes are header-only C++ exercised by the CPU suites, but
 `build/q27-server` and `q27-metal-server` both still want a real compile before
 anyone leans on this.
+
+## 2026-08-22 (b): `--constrain-tools` guaranteed the SHAPE and nothing else -- schema-invalid calls, 200 OK, zero drift logged
+
+Filed as issue #2 against `da3d2fc`, from a live agentic session on
+`qwen38-27b-mtp` with `--constrain-tools`. The agent was asked to write a file.
+Every attempt came back from the CLIENT as schema-invalid:
+
+```
+Validation failed for tool "write":
+  - path: must have required properties path, content
+  Received arguments: {}
+```
+
+and the server log for the same turn was clean:
+
+```
+[toolgram] engaged (rem=0, dialect=xml)
+<function=write>
+<parameter=content>
+...
+</parameter>
+</function>
+</tool_call>
+[toolgram] call closed
+```
+
+`<parameter=path>` was never emitted, and the grammar **accepted the close
+anyway**. The file stayed 0 bytes across every retry.
+
+### What the guarantee actually covered
+
+`ToolGrammarXml` shipped as "schema-aware", and it was -- for the ALLOWLIST.
+`tool_param_keys_per_name()` extracts `properties`, so the grammar knows which
+keys *may* appear. `parameters.required` was parsed **nowhere**: the only
+consumer of `required` in the tree was `infer_tool_name()`, the post-hoc
+mode-6 rescue that guesses which tool an orphaned args object belongs to --
+after-the-fact selection, not decode-time enforcement. So the grammar had no
+notion of which keys *had* appeared, `DONE_` accepted `</function>` on any
+subset including the empty one, and `KEY`->`GT2` let the same key open twice.
+
+Two failure classes fell straight through a constraint advertised as a hard
+correctness guarantee: **missing required arguments** and **duplicate keys**.
+The duplicate one compounded in the live session because the file being written
+was itself a tool-call verifier -- its content quoted `</parameter>
+<parameter=content>`, the model emitted those as real tags mid-value, and the
+grammar accepted the second `content` key, doubling the value.
+
+### Why every safety net stayed quiet
+
+This is the fourth time in this log, and the sharpest instance. `[drift]
+UN-RESCUED` and `Q27_DRIFT_CORPUS` fire when the FALLBACK PARSER fails. These
+calls parsed perfectly -- they were well-formed XML naming a declared tool. So
+the corpus stayed empty, the drift counters stayed zero, every response was
+200, and the speculative/decode stats were normal. **The only component in the
+system that knew anything was wrong was the client's JSON-schema validator, on
+the other side of the wire.** An instrument that reports "did the parser
+succeed?" cannot see "did the parser succeed at producing garbage."
+
+Worth stating plainly: constraining the SHAPE of a call and constraining its
+VALIDITY are different guarantees, and the config claiming the former as the
+latter is how this shipped.
+
+### The fix
+
+`required` is threaded to where the decision is made. `ToolGrammarXml` now
+tracks the emitted-key set per call, masks `</function>` until every required
+key has appeared, and rejects a duplicate key open. `tool_required_keys_per_name()`
+is a separate extractor from `tool_param_keys_per_name()` deliberately -- the
+allowlist answers "may this key appear?", the required set answers "must it
+have appeared before the call may close?", and folding them hid that they are
+different questions.
+
+The emitted set is part of `signature()`, because token legality now depends on
+it in two states: `KEY` (a duplicate is illegal) and `SLASH` (`</function>` is
+illegal until required are satisfied). Omitting it would let a cached mask
+authorise a close the grammar must refuse. The set is monotone within a call,
+so this costs at most one extra cached state per parameter rather than a
+combinatorial blow-up.
+
+DEGRADES, does not break: no `required` list (or no schema at all) keeps the
+previous shape-only behaviour, so callers that lack the schema -- Metal's 1-arg
+`begin()`, any future caller -- are unaffected. Optional parameters stay
+optional, and parameter ORDER is still free, because the schema says nothing
+about it.
+
+Worst case after the fix is an empty-but-present `path`: schema-valid, the
+client accepts it, and the agent can proceed. That is strictly better than
+`{}`.
+
+### Not fixed here, recorded
+
+The **JSON dialect** (`ToolGrammar`) is not schema-aware at all -- its
+`reset()` takes only tool names and constrains `arguments` as generic valid
+JSON, so it would emit `{"content": ...}` without `path`, and undeclared keys
+too. Same hole, other dialect. Left alone because the trained 3.8 format is
+XML and this needed to land on the reported failure first.
+
+Also still open: a parameter VALUE that legitimately contains `</tool_call>`
+truncates the call at the inner tag (the write-up documenting this very bug was
+itself cut at 651 bytes by it). Needs the TOOL channel to close only on a
+balanced dialect.
+
+### Measured
+
+`test_toolconstrain` 149 assertions, the new ones red before the change: the
+live shapes (missing required, `{}`, duplicate key) all refuse; valid calls in
+either parameter order still pass; optional-omitted passes; no-schema and
+no-required stay permissive; and the cache key provably distinguishes two
+states whose `</function>` legality differs. Full `make test-tools` green from
+a clean build.
+
+NOT VERIFIED: no live re-run of the failing session (needs the GPU host), and
+neither backend compiled -- no CUDA and no Apple-silicon machine available.

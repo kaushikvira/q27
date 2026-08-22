@@ -2096,6 +2096,39 @@ tool_param_keys_per_name(const json& tools) {
     return out;
 }
 
+// REQUIRED-argument lists, aligned with tool_names_v exactly like
+// tool_param_keys_per_name above. Split out rather than folded into that
+// function because the allowlist and the required set answer different
+// questions: "may this key appear?" vs "must it have appeared before the call
+// may close?". Only the first was ever threaded into the grammar, which is why
+// --constrain-tools emitted schema-invalid calls with a well-formed shape
+// (issue #2): a <function=write> that never produced <parameter=path> closed
+// cleanly, the server returned 200, no drift was logged, and the client's
+// schema validation was the only thing that noticed.
+inline std::vector<std::vector<std::string>>
+tool_required_keys_per_name(const json& tools) {
+    std::vector<std::vector<std::string>> out;
+    if (!tools.is_array()) return out;
+    out.reserve(tools.size());
+    for (const auto& t : tools) {
+        std::vector<std::string> keys;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].contains("required") &&
+            t["function"]["parameters"]["required"].is_array()) {
+            for (const auto& k : t["function"]["parameters"]["required"])
+                if (k.is_string()) keys.push_back(k.get<std::string>());
+        }
+        out.push_back(std::move(keys));
+    }
+    return out;
+}
+inline std::vector<std::vector<std::string>>
+tool_required_keys_per_name(const OpenAIToolSelection& selected) {
+    json arr = json::array();
+    for (const auto& t : selected.tools) arr.push_back(t);
+    return tool_required_keys_per_name(arr);
+}
+
 // Anthropic counts every declaration even when tool_choice narrows eligibility.
 // The inactive block keeps that accounting while leaving only selected schemas
 // in the callable interface. This choice-specific system prompt is intentional:
