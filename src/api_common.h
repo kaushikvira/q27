@@ -2096,6 +2096,50 @@ tool_param_keys_per_name(const json& tools) {
     return out;
 }
 
+// Required-parameter extraction (2026-08-22 completeness gate). Each tool's
+// `parameters.required` array, aligned with `names`/params_per_name. The XML
+// grammar uses this to mask `</function>` until every required key has been
+// emitted -- a call can never close schema-incomplete (e.g. `write` without
+// `path`, or a bare `{}`). Mirrors tool_param_keys_per_name exactly so the two
+// vectors stay index-aligned.
+inline std::vector<std::vector<std::string>>
+tool_required_keys_per_name(const OpenAIToolSelection& selected) {
+    std::vector<std::vector<std::string>> out;
+    out.reserve(selected.tools.size());
+    for (const auto& t : selected.tools) {
+        std::vector<std::string> req;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].is_object() &&
+            t["function"]["parameters"].contains("required") &&
+            t["function"]["parameters"]["required"].is_array()) {
+            for (const auto& r : t["function"]["parameters"]["required"])
+                if (r.is_string()) req.push_back(r.get<std::string>());
+        }
+        out.push_back(std::move(req));
+    }
+    return out;
+}
+
+// json-array overload (mirrors tool_param_keys_per_name).
+inline std::vector<std::vector<std::string>>
+tool_required_keys_per_name(const json& tools) {
+    std::vector<std::vector<std::string>> out;
+    if (!tools.is_array()) return out;
+    out.reserve(tools.size());
+    for (const auto& t : tools) {
+        std::vector<std::string> req;
+        if (t.contains("function") && t["function"].contains("parameters") &&
+            t["function"]["parameters"].is_object() &&
+            t["function"]["parameters"].contains("required") &&
+            t["function"]["parameters"]["required"].is_array()) {
+            for (const auto& r : t["function"]["parameters"]["required"])
+                if (r.is_string()) req.push_back(r.get<std::string>());
+        }
+        out.push_back(std::move(req));
+    }
+    return out;
+}
+
 // Anthropic counts every declaration even when tool_choice narrows eligibility.
 // The inactive block keeps that accounting while leaving only selected schemas
 // in the callable interface. This choice-specific system prompt is intentional:

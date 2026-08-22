@@ -529,6 +529,74 @@ static void test_xml_constrainer_dialect_dispatch() {
     CHECK(!g2.advance_str("<function=bash>\n<parameter=evil>\nrm -rf /\n</parameter>\n</function>\n"));
 }
 
+// R5 (2026-08-22, fork issue #2): schema completeness gate. `</function>` must
+// be masked until every required key has been emitted, duplicate key opens must
+// be rejected, and tools with no required set must behave exactly as before.
+static void test_xml_required_gate() {
+    // write tool: params {path, content}, required {path, content}
+    std::vector<std::vector<std::string>> pp = {{"path", "content"}};
+    std::vector<std::vector<std::string>> rp = {{"path", "content"}};
+
+    // (a) complete call (either order) closes legally
+    {
+        q27::ToolGrammarXml g;
+        g.reset({"write"}, pp, rp);
+        CHECK(g.advance_str("<function=write>\n"
+                            "<parameter=content>\nhi\n</parameter>\n"
+                            "<parameter=path>\nf.txt\n</parameter>\n"
+                            "</function>\n</tool_call>\n"));
+        CHECK(g.done());
+    }
+    {
+        q27::ToolGrammarXml g;
+        g.reset({"write"}, pp, rp);
+        CHECK(g.advance_str("<function=write>\n"
+                            "<parameter=path>\nf.txt\n</parameter>\n"
+                            "<parameter=content>\nhi\n</parameter>\n"
+                            "</function>\n"));
+        CHECK(g.done());
+    }
+
+    // (b) missing required 'path': the 'f' of </function> is masked
+    {
+        q27::ToolGrammarXml g;
+        g.reset({"write"}, pp, rp);
+        CHECK(g.advance_str("<function=write>\n<parameter=content>\nhi\n</parameter>\n"));
+        CHECK(!g.advance_str("</function>\n</tool_call>\n"));
+    }
+
+    // (c) duplicate key open rejected (the self-reference leak from the field
+    // report: verify_tool_calls.py content contained literal </parameter> and a
+    // second <parameter=content> was emitted mid-call)
+    {
+        q27::ToolGrammarXml g;
+        g.reset({"write"}, pp, rp);
+        CHECK(g.advance_str("<function=write>\n"
+                            "<parameter=path>\nf.txt\n</parameter>\n"
+                            "<parameter=content>\nfirst\n</parameter>\n"));
+        CHECK(!g.advance_str("<parameter=content>\nsecond\n</parameter>\n"
+                             "</function>\n</tool_call>\n"));
+    }
+
+    // (d) tool with params but empty required set: unchanged permissive close
+    {
+        q27::ToolGrammarXml g;
+        g.reset({"frob"}, {{"a", "b"}}, {});
+        CHECK(g.advance_str("<function=frob>\n<parameter=a>\n1\n</parameter>\n"
+                            "</function>\n</tool_call>\n"));
+        CHECK(g.done());
+    }
+
+    // (e) required key present but a DIFFERENT required key missing (content
+    // never supplied) is still blocked.
+    {
+        q27::ToolGrammarXml g;
+        g.reset({"write"}, pp, rp);
+        CHECK(g.advance_str("<function=write>\n<parameter=path>\nf.txt\n</parameter>\n"));
+        CHECK(!g.advance_str("</function>\n</tool_call>\n"));
+    }
+}
+
 int main() {
     test_c1_engage_truncate_midround();
     test_c2_marker_spans_rounds();
@@ -547,6 +615,7 @@ int main() {
     test_xml_grammar_valid_and_prevention();
     test_xml_cache_allowlist_in_key();
     test_xml_constrainer_dialect_dispatch();
+    test_xml_required_gate();
     if (fails) {
         fprintf(stderr, "test_toolconstrain: %d FAILED\n", fails);
         return 1;

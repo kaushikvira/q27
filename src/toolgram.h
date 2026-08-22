@@ -478,19 +478,38 @@ struct ToolMaskCache {
 struct ToolGrammarXml {
     // names-only reset (no schema): parameter keys unrestricted
     void reset(const std::vector<std::string>& tool_names) {
-        reset(tool_names, {});
+        reset(tool_names, {}, {});
     }
     // schema-aware reset: params_per_name aligned with tool_names
     void reset(const std::vector<std::string>& tool_names,
                const std::vector<std::vector<std::string>>& params_per_name) {
+        reset(tool_names, params_per_name, {});
+    }
+    // Schema-aware + required (2026-08-22 completeness gate): `required_per_name`
+    // aligned with params_per_name carries each tool's `parameters.required`
+    // set. Decode-time guarantees, applied ON TOP of the existing shape rules:
+    //   (1) `</function>` is masked until every required key of the current
+    //       tool has been emitted -- a call can never close schema-incomplete
+    //       (e.g. `write` without `path`).
+    //   (2) a parameter key may only be opened once per function -- duplicates
+    //       (the model re-emitting `<parameter=content>` mid-content) are
+    //       rejected.
+    // Both unmaskable paths are dead states, so the model is forced to supply
+    // the missing keys or regenerate -- the client can no longer receive a
+    // call its schema validation must reject.
+    void reset(const std::vector<std::string>& tool_names,
+               const std::vector<std::vector<std::string>>& params_per_name,
+               const std::vector<std::vector<std::string>>& required_per_name) {
         names_ = tool_names;
         params_per_name_ = params_per_name;
+        required_per_name_ = required_per_name;
         std::vector<std::string> sorted = tool_names;
         std::sort(sorted.begin(), sorted.end());
         names_key_.clear();
         for (auto& n : sorted) { names_key_ += n; names_key_ += '\x1f'; }
         cur_params_key_.clear();
         cur_name_idx_ = -1;
+        emitted_.clear();
         st_ = WS0;
         name_pref_.clear();
         key_pref_.clear();
@@ -585,6 +604,9 @@ struct ToolGrammarXml {
                                 std::sort(pk.begin(), pk.end());
                                 for (auto& k : pk) { cur_params_key_ += k; cur_params_key_ += '\x1f'; }
                             }
+                            // per-allowlist-index emitted flags for this function
+                            emitted_.assign(i < params_per_name_.size() ?
+                                            params_per_name_[i].size() : 0, 0);
                             st_ = GT1;
                             return true;
                         }
@@ -630,8 +652,15 @@ struct ToolGrammarXml {
                         return true;
                     }
                     if (cur_name_idx_ >= 0 && cur_name_idx_ < (int)params_per_name_.size()) {
-                        for (auto& k : params_per_name_[cur_name_idx_])
-                            if (k == key_pref_) { st_ = GT2; return true; }
+                        const auto& pk = params_per_name_[cur_name_idx_];
+                        for (size_t k = 0; k < pk.size(); k++)
+                            if (pk[k] == key_pref_) {
+                                // completeness gate (2): reject a duplicate key open
+                                if (k < emitted_.size() && emitted_[k]) return false;
+                                if (k < emitted_.size()) emitted_[k] = 1;
+                                st_ = GT2;
+                                return true;
+                            }
                     }
                     return false;
                 }
@@ -666,7 +695,13 @@ struct ToolGrammarXml {
                 return false;
             case SLASH:
                 if (c == 'p') { lit_word_ = "</parameter>"; lit_ = 3; st_ = PARAM_CLOSE; return true; }
-                if (c == 'f') { lit_word_ = "</function>"; lit_ = 3; st_ = FUNC_CLOSE; return true; }
+                if (c == 'f') {
+                    // completeness gate (1): `</function>` is masked until every
+                    // required key of the current tool has been emitted, so a
+                    // call can never close schema-incomplete.
+                    if (!required_ok()) return false;
+                    lit_word_ = "</function>"; lit_ = 3; st_ = FUNC_CLOSE; return true;
+                }
                 return false;
             case PARAM_CLOSE:
                 if (lit_ < lit_word_.size()) {
@@ -702,8 +737,32 @@ struct ToolGrammarXml {
         return false;
     }
 
+    // true when every required key of the current function has been emitted.
+    // No schema / no required set => gate off (matches old permissive close).
+    bool required_ok() const {
+        if (cur_name_idx_ < 0) return true;
+        if (cur_name_idx_ >= (int)required_per_name_.size()) return true;
+        if (cur_name_idx_ >= (int)params_per_name_.size()) return true; // no allowlist -> no gate
+        const auto& req = required_per_name_[cur_name_idx_];
+        if (req.empty()) return true;
+        const auto& pk = params_per_name_[cur_name_idx_];
+        for (const auto& r : req) {
+            bool found = false;
+            for (size_t k = 0; k < pk.size(); k++)
+                if (pk[k] == r) {
+                    found = true;
+                    if (!(k < emitted_.size() && emitted_[k])) return false; // required key missing
+                    break;
+                }
+            if (!found) return false; // required key not even declared -> unsatisfiable
+        }
+        return true;
+    }
+
     std::vector<std::string> names_;
     std::vector<std::vector<std::string>> params_per_name_;
+    std::vector<std::vector<std::string>> required_per_name_;
+    std::vector<char> emitted_; // per-allowlist-index emitted flags (current function)
     std::string names_key_;
     std::string cur_params_key_;
     std::string name_pref_;
