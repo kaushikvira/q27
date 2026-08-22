@@ -1464,6 +1464,54 @@ static void test_tool_segment_strict_leg() {
        "strict: a refused TOOL segment is NOT routed through the drift chain");
 }
 
+// Live failure 2026-08-22: after 8 clean tool calls the model emitted the
+// OPENER TWICE and hit EOS. The splitter consumes the first (structural) and
+// enters the TOOL channel; inside TOOL only "</tool_call>" delimits, so the
+// second opener is BODY CONTENT. unfinished_tool_wrapper() reports false (it
+// detects length/budget truncation, not EOS-inside-wrapper), so the tail path
+// never runs, and the fallback printed ToolCall::raw -- the literal string
+// "<tool_call>" became the user's entire visible answer for the turn.
+static void test_repeated_opener_is_not_shown_as_text() {
+    json tools = json::array({tool("bash", {{"command", true}})});
+
+    for (const char* raw : {"<tool_call><tool_call>",
+                            "<tool_call>\n<tool_call>",
+                            "<tool_call>\n\n<tool_call>\n",
+                            "<tool_call><tool_call><tool_call>"}) {
+        auto out = resolve_stream(raw, &tools);
+        ok(out.calls.empty() && out.text.find("<tool_call>") == std::string::npos,
+           "repeated opener: no call, and the marker is not shown as text");
+    }
+
+    // The predicate itself. NARROW on purpose: dialect tags that can carry a
+    // payload are NOT control-only, because a body containing them is drift
+    // whose bytes the user may need to see.
+    ok(q27::only_dialect_control_bytes("<tool_call>"), "control-only: bare opener");
+    ok(q27::only_dialect_control_bytes(" \n</tool_call>\t"), "control-only: closer + ws");
+    ok(q27::only_dialect_control_bytes("<tool_call>\n</tool_call>"),
+       "control-only: opener + closer");
+    ok(!q27::only_dialect_control_bytes("   \n\t "),
+       "control-only: pure whitespace is NOT claimed");
+    ok(!q27::only_dialect_control_bytes("<function=bash>"),
+       "control-only: a payload-bearing dialect tag is drift, stays visible");
+    ok(!q27::only_dialect_control_bytes("<tool_call>{\"name\":\"bash\"}"),
+       "control-only: real content alongside a marker stays visible");
+
+    // A malformed body that is NOT control-only must still reach the user.
+    {
+        auto out = resolve_stream("<tool_call>\n{\"nam\": \"bas\", oops\n</tool_call>", &tools);
+        ok(out.calls.empty() && out.text.find("oops") != std::string::npos,
+           "malformed body still visible (suppression did not overreach)");
+    }
+    // and a well-formed call is unaffected
+    {
+        auto out = resolve_stream(
+            "<tool_call>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}\n</tool_call>", &tools);
+        ok(out.calls.size() == 1 && out.calls[0].name == "bash",
+           "well-formed wrapped call unaffected by the suppression");
+    }
+}
+
 int main() {
     if (getenv("Q27_TOOL_STRICT")) {
         test_tool_segment_strict_leg();
@@ -1496,6 +1544,7 @@ int main() {
     test_mode15_name_tag_bare_args();
     test_mode16_and_15_variants();
     test_hallucinated_result_enclosure_rule();
+    test_repeated_opener_is_not_shown_as_text();
     json tools = json::array();
     tools.push_back(tool("Write", {{"content", true}, {"file_path", true}}));
     tools.push_back(tool("Read", {{"file_path", true}}));

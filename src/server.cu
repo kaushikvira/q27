@@ -2343,7 +2343,17 @@ int main(int argc, char** argv) {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) emit_text(c.raw);
+                        if (!classify_bare(c.raw,true,emit_text)) {
+                            // dialect control bytes only (a repeated <tool_call>
+                            // opener at EOS) -- no call, and echoing the marker
+                            // is worse than saying nothing. Logged, not silent.
+                            if (q27::only_dialect_control_bytes(c.raw))
+                                fprintf(stderr,
+                                    "[q27] tool body was dialect control bytes only "
+                                    "(%zu B) -- no call; suppressed from visible text\n",
+                                    c.raw.size());
+                            else emit_text(c.raw);
+                        }
                     } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 auto emit_seg = [&](StreamSplitter::Chan ch, const std::string& t) {
@@ -2911,7 +2921,17 @@ int main(int argc, char** argv) {
                     auto c = q27::parse_tool_call(q27::strip_ws2(tool_buf));
                     tool_buf.clear();
                     if (!c.ok) {
-                        if (!classify_bare(c.raw,true,emit_text)) emit_text(c.raw);
+                        if (!classify_bare(c.raw,true,emit_text)) {
+                            // dialect control bytes only (a repeated <tool_call>
+                            // opener at EOS) -- no call, and echoing the marker
+                            // is worse than saying nothing. Logged, not silent.
+                            if (q27::only_dialect_control_bytes(c.raw))
+                                fprintf(stderr,
+                                    "[q27] tool body was dialect control bytes only "
+                                    "(%zu B) -- no call; suppressed from visible text\n",
+                                    c.raw.size());
+                            else emit_text(c.raw);
+                        }
                     } else if (!emit_call(c)) emit_text(c.raw);
                 };
                 bool forced_control_token = false;

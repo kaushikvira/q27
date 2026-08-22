@@ -4493,6 +4493,42 @@ struct OrderedToolOutput {
     }
 };
 
+// A TOOL body that recovered NOTHING and consists only of dialect control
+// bytes carries no information for the user -- showing it just leaks protocol.
+//
+// The shape that made this necessary (2026-08-22, live): the model emitted the
+// opener TWICE and then hit EOS --
+//
+//   <tool_call>          <- structural; the splitter erases it, enters TOOL
+//   <tool_call>          <- inside TOOL only "</tool_call>" delimits, so this
+//   (EOS)                   is BODY CONTENT, not a marker
+//
+// unfinished_tool_wrapper() reports false (it detects length/budget truncation,
+// not EOS-inside-wrapper), so the unclosed-tail path never runs. emit_tool()
+// then fails to parse, the drift chain finds nothing, and the fallback prints
+// ToolCall::raw -- which IS the literal string "<tool_call>". The user's
+// visible answer for the whole turn was that one marker.
+//
+// Deliberately NARROW: whitespace plus <tool_call>/</tool_call> only. Dialect
+// tags that can carry a payload (<function=...>, <parameter=...>) are NOT
+// stripped, because a body containing those is a malformed CALL whose bytes the
+// user may need to see -- that is drift, and drift stays visible. This only
+// suppresses residue that is provably content-free.
+//
+// The turn is lost either way; this decides what the user sees, and callers log
+// so the loss is not silent.
+inline bool only_dialect_control_bytes(const std::string& s) {
+    size_t i=0;
+    bool saw_marker=false;
+    while(i<s.size()) {
+        if(isspace((unsigned char)s[i])) { i++; continue; }
+        if(s.compare(i,11,"<tool_call>")==0) { i+=11; saw_marker=true; continue; }
+        if(s.compare(i,12,"</tool_call>")==0) { i+=12; saw_marker=true; continue; }
+        return false;
+    }
+    return saw_marker; // pure whitespace is not this function's business
+}
+
 inline std::string take_unclosed_final_tool_segment(
     std::vector<std::pair<StreamSplitter::Chan,std::string>>& segments,
     bool wrapper_incomplete) {
@@ -4631,6 +4667,13 @@ inline OrderedToolOutput resolve_ordered_tool_segments(
         // No EOF repair: the wrapper closed, so this is drift, not truncation.
         // A wrapper that did NOT close was already removed by
         // take_unclosed_final_tool_segment before this loop.
+        if(only_dialect_control_bytes(body)) {
+            fprintf(stderr,"[q27] tool body was dialect control bytes only "
+                           "(%zu B, e.g. a repeated <tool_call> opener) -- "
+                           "turn produced no call; suppressed from visible text\n",
+                    body.size());
+            continue;
+        }
         append_text(body,false);
     }
     flush_pending_text(true);
