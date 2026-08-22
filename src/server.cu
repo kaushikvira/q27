@@ -1162,9 +1162,23 @@ int main(int argc, char** argv) {
     // masks (different grammar signatures).
     q27::ToolMaskCache<q27::ToolGrammarXml> tool_mask_cache_xml;
     tool_mask_cache_xml.init(&vocab_bytes_v, tok.token_id("</tool_call>"));
-    if (constrain_tools)
-        fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d)\n",
-                tok.token_id("<tool_call>"), tok.token_id("</tool_call>"));
+    if (constrain_tools) {
+        fprintf(stderr, "constrain-tools: grammar-locked <tool_call> bodies (open=%d close=%d, dialect=%s)\n",
+                tok.token_id("<tool_call>"), tok.token_id("</tool_call>"),
+                q27::tool_dialect_xml() ? "xml" : "json");
+        // Scope of the guarantee, stated at boot rather than discovered from a
+        // client-side validation error (issue #2). Required-argument and
+        // duplicate-key enforcement lives in ToolGrammarXml only; the JSON
+        // dialect constrains SHAPE alone, so on that path a schema-invalid
+        // call (missing required key, undeclared key) is still sampleable.
+        if (q27::tool_dialect_xml())
+            fprintf(stderr, "constrain-tools: enforcing required args + "
+                            "rejecting duplicate/undeclared param keys\n");
+        else
+            fprintf(stderr, "constrain-tools: WARNING json dialect enforces SHAPE ONLY -- "
+                            "required args, duplicate and undeclared keys are NOT "
+                            "constrained (XML dialect only)\n");
+    }
 
     // R1b: FIFO ticket gate time-slices the GPU across concurrent
     // generations (q27::GpuGate). Engines are claimed via Slot::busy under

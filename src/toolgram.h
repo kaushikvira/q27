@@ -17,6 +17,21 @@
 
 namespace q27 {
 
+// JSON-dialect body grammar (3.6 format, `{"name":..., "arguments":{...}}`).
+//
+// SCOPE, and a KNOWN GAP recorded deliberately (issue #2, 2026-08-22): this
+// machine constrains SHAPE only. reset() takes tool names and nothing else,
+// and `arguments` is constrained as generic valid JSON, so it will happily
+// sample a call with a REQUIRED key missing, with an UNDECLARED key, or with a
+// DUPLICATE key. ToolGrammarXml enforces all three; this does not.
+//
+// That asymmetry is a decision, not an oversight: the trained 3.8 emission is
+// the XML dialect, which is where the live failures were observed, and closing
+// this hole means constraining object keys at exactly ONE nesting level (the
+// top of `arguments`, leaving nested object keys free) inside a generic JSON
+// FSM with escape/\uXXXX key handling -- more machinery than the JSON path
+// currently earns. server.cu warns at boot when --constrain-tools is enabled
+// on this dialect so the reduced guarantee is visible rather than assumed.
 struct ToolGrammar {
     void reset(const std::vector<std::string>& tool_names) {
         names_ = tool_names;

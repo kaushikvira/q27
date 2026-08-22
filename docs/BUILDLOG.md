@@ -14281,9 +14281,24 @@ client accepts it, and the agent can proceed. That is strictly better than
 
 The **JSON dialect** (`ToolGrammar`) is not schema-aware at all -- its
 `reset()` takes only tool names and constrains `arguments` as generic valid
-JSON, so it would emit `{"content": ...}` without `path`, and undeclared keys
-too. Same hole, other dialect. Left alone because the trained 3.8 format is
-XML and this needed to land on the reported failure first.
+JSON, so it will sample `{"content": ...}` without `path`, an undeclared key,
+or a duplicate key. Same hole, other dialect. Measured, not assumed: all four
+shapes accept on that path.
+
+DECIDED, not deferred by accident. The trained 3.8 emission is XML, which is
+where every observed failure came from. Closing the JSON hole means
+constraining object keys at exactly ONE nesting level -- the top of
+`arguments`, with nested object keys still free -- inside a generic JSON FSM
+that also has to handle `\uXXXX` and escapes in key strings. That is more
+machinery than the JSON path currently earns, and getting it subtly wrong would
+constrain keys it must not.
+
+So the reduced guarantee is made VISIBLE instead: `--constrain-tools` now
+prints its dialect and its scope at boot -- enforcing required args on XML, or
+`WARNING json dialect enforces SHAPE ONLY` -- and `ToolGrammar` carries the gap
+in a header comment. The whole lesson of this log is that a hole nobody can see
+survives; an operator should learn the scope of the guarantee from the startup
+line, not from a client-side validation error three turns into a session.
 
 Also still open: a parameter VALUE that legitimately contains `</tool_call>`
 truncates the call at the inner tag (the write-up documenting this very bug was
